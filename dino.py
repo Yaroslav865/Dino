@@ -1,101 +1,432 @@
-import os
-import random
-import threading
-import time
+import random                 # случайные действия (исследование) и выборка из буфера
+import threading              # 4 окна = 4 потока + общий доступ к сети и буферу
+import time                   # паузы между решениями и таймауты
+from collections import deque # буфер воспроизведения фиксированной длины
+from pathlib import Path      # путь к файлу модели независимо от текущей папки
 
-import numpy as np
-from playwright.sync_api import sync_playwright
+import numpy as np                 # вектор состояния и стек батча
+import torch                       # сама сеть и автоградиент
+import torch.nn as nn              # слои (Linear), clip_grad_norm_
+import torch.nn.functional as F    # ReLU и smooth_l1_loss
+from playwright.sync_api import sync_playwright  # управление Chrome
 
 GAME_URL = "https://wayou.github.io/t-rex-runner/"
 
-# ---------------- параметры обучения ----------------
-WINDOWS = 4              # сколько окон Chrome обучаются одновременно
-HEADLESS = False         # True - без окон
-EPISODES = 400           # всего эпизодов на все окна
-ALPHA = 0.15             # скорость обучения
-GAMMA = 0.97             # дисконт
-EPSILON = 0.10           # случайные действия в начале
-EPSILON_MIN = 0.02       # случайные действия в конце
-STEP_DELAY = 0.02        # пауза между решениями, сек
-MAX_STEPS = 0            # 0 = без лимита, эпизод до падения
-MAX_EPISODE_SECONDS = 300
-SAVE_EVERY = 10
-MODEL_FILE = "q_table.npy"
+# ---------------- параметры ----------------
+WINDOWS = 5     # сколько окон Chrome обучаются одновременно
+HEADLESS = False          # True - без окон (быстрее, но не видно процесса)
+EPISODES = 3000          # всего эпизодов на все окна
+TIME_LIMIT_MINUTES = 240  # остановка по времени
+MAX_STEPS = 0             # 0 = без лимита шагов, эпизод до падения
+MAX_EPISODE_SECONDS = 300 # страховка от бесконечного эпизода
+STEP_DELAY = 0.02         # пауза между решениями: ~50 решений в секунду
 
-# Действия: 0 = бежать, 1 = прыгать, 2 = присесть
-ACTIONS = 3
-ACTION_NAMES = ["НЕ ПРЫГАТЬ", "ПРЫГАТЬ", "ПРИСЕСТЬ"]
+GAMMA = 0.99              # дисконт: насколько важна будущая награда
+LR = 1e-3                 # шаг оптимизатора Adam
+BATCH = 64                # размер батча на одном шаге обучения
+BUFFER_SIZE = 100_000     # сколько переходов хранить в памяти
+TRAIN_EVERY = 4           # обучать раз в 4 решения
+TARGET_SYNC = 1000        # как часто копировать online-сеть в target-сеть
+HIDDEN = 128              # число нейронов в скрытом слое
 
-# Классы препятствий
-NO_OBSTACLE = 0
-CACTUS_SMALL = 1
-CACTUS_LARGE = 2
-BIRD_LOW = 3      # у земли - надо прыгать
-BIRD_MID = 4      # средняя высота - надо присесть
-BIRD_HIGH = 5     # высокая - можно бежать
-CLASS_NAMES = {
-    NO_OBSTACLE: "нет препятствия",
-    CACTUS_SMALL: "кактус малый",
-    CACTUS_LARGE: "кактус большой",
-    BIRD_LOW: "птица низко (прыжок)",
-    BIRD_MID: "птица средне (присед)",
-    BIRD_HIGH: "птица высоко (пропуск)",
-}
+DIST_REWARD = 0.01        # награда за единицу пройденной дистанции
+PASS_REWARD = 1.0         # награда за каждое пройденное препятствие
+CRASH_REWARD = -10.0      # штраф за падение
 
-q_table = {}
-q_lock = threading.Lock()
-episode_lock = threading.Lock()
-episodes_started = 0
-stop_event = threading.Event()
+EPS_START = 0.30          # доля случайных действий в начале
+EPS_END = 0.0             # в конце играем строго по сети, без случайности
+EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройти от EPS_START к EPS_END
 
+# учебная программа: (ограничение скорости, средняя дистанция для перехода)
+CURRICULUM = [(6.5, 8000), (9.0, 20000), (13.0, None)]
+
+SAVE_EVERY = 20                     # сохранять модель каждые N эпизодов
+METRIC_VERSION = 2                  # версия методики замера дистанции
+MODEL_FILE = Path(__file__).resolve().parent / "dqn.pt"       # последние веса
+BEST_FILE = Path(__file__).resolve().parent / "best_dqn.pt"   # лучшие веса
+RESULTS_FILE = Path(__file__).resolve().parent / "results.csv"  # журнал эпизодов
+
+# ---------------- действия ----------------
+ACTION_RUN, ACTION_JUMP, ACTION_DUCK = 0, 1, 2  # коды действий
+N_ACTIONS = 3                                    # сколько выходов у сети
+
+# ---------------- классы препятствий ----------------
+NO_OBSTACLE = 0     # препятствий нет
+CACTUS_SMALL = 1    # кактус малый
+CACTUS_LARGE = 2    # кактус большой
+BIRD_LOW = 3        # птица у земли: надо прыгать
+BIRD_MID = 4        # птица на средней высоте: надо присесть
+BIRD_HIGH = 5       # птица высоко: можно бежать
+
+N_INPUT = 12             # размер вектора состояния
+DINO_FRONT_OFFSET = 40   # нос динозавра относительно tRex.xPos
+
+# ---------------- правила прыжка ----------------
+JUMP_MIN_FRAMES = 6      # раньше этого прыжок бесполезен (нос ещё далеко)
+JUMP_MAX_FRAMES = 24     # позже этого прыжок уже не спасёт от препятствия
+JUMPABLE = (CACTUS_SMALL, CACTUS_LARGE, BIRD_LOW)  # что перепрыгивается
+
+torch.set_num_threads(2)  # не занимать все ядра: 4 окна и так грузят CPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # GPU, если есть
+
+# ---------------- общие объекты потоков ----------------
+stop_event = threading.Event()   # сигнал "остановиться" для всех окон
+episode_lock = threading.Lock()  # защита счётчика эпизодов
+results_lock = threading.Lock()  # защита записи в results.csv
+episodes_started = 0             # сколько эпизодов уже начато
+curriculum_lock = threading.Lock()  # защита номера этапа
+curriculum_stage = 0                # текущий этап учебной программы
+
+
+def log(message):
+    """Печать с временем. flush=True нужен, чтобы строки не залипали в буфере."""
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def init_results_file():
+    """Создать results.csv с заголовком, чтобы файл был виден сразу."""
+    if not RESULTS_FILE.exists():
+        RESULTS_FILE.write_text(
+            "time,window,episode,distance,steps,reward,epsilon,stage,reason,best_average\n",
+            encoding="utf-8",
+        )
+
+
+def write_result(window_id, episode, result, epsilon, stage, best_average):
+    """Дописать строку об эпизоде в results.csv."""
+    line = (
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')},{window_id},{episode},"
+        f"{result['distance']},{result['steps']},{result['reward']:.2f},"
+        f"{epsilon:.3f},{stage},{result['reason']},{best_average:.0f}\n"
+    )
+    with results_lock:
+        with RESULTS_FILE.open("a", encoding="utf-8") as file:
+            file.write(line)
+
+
+def current_max_speed():
+    """Текущее ограничение скорости для учебной программы."""
+    with curriculum_lock:
+        return CURRICULUM[curriculum_stage][0]
+
+
+def maybe_advance_curriculum(recent_average):
+    """Перейти на следующий этап, если средняя дистанция выше порога."""
+    global curriculum_stage
+    with curriculum_lock:
+        if curriculum_stage >= len(CURRICULUM) - 1:  # последний этап
+            return False
+        limit = CURRICULUM[curriculum_stage][1]      # порог текущего этапа
+        if limit is None or recent_average < limit:  # ещё рано
+            return False
+        curriculum_stage += 1                        # следующий этап
+        speed = CURRICULUM[curriculum_stage][0]
+        stage = curriculum_stage + 1
+    log(f"учебная программа: этап {stage}, MAX_SPEED={speed}")
+    return True
+
+
+# ---------------- чтение состояния из игры ----------------
 STATE_JS = """
 () => {
     const runner = window.Runner && window.Runner.instance_;
-    if (!runner) return {status: "NO_RUNNER"};
-    if (runner.crashed) return {status: "DEAD"};
-    if (!runner.playing) return {status: "NOT_PLAYING"};
+    if (!runner) return {status: "NO_RUNNER"};      // игра ещё не создана
+    if (document.visibilityState !== "visible") return {status: "HIDDEN"};  // окно свёрнуто
+    if (runner.crashed) return {status: "DEAD"};    // динозавр разбился
+    if (!runner.playing) return {status: "NOT_PLAYING"};  // пауза
 
     const dino = runner.tRex;
     const list = runner.horizon.obstacles || [];
     const obstacles = [];
     for (let i = 0; i < list.length && obstacles.length < 2; i++) {
         const o = list[i];
+        // пропускаем препятствия, которые уже полностью позади динозавра
         if (o.xPos + o.width <= dino.xPos - 20) continue;
         obstacles.push({x: o.xPos, w: o.width, y: o.yPos, t: o.typeConfig.type});
     }
 
     return {
         status: "OK",
-        x: dino.xPos,
-        y: dino.yPos,
-        speed: runner.currentSpeed,
-        jumping: dino.jumping,
-        ducking: dino.ducking,
-        dist: runner.distanceRan,
-        obstacles: obstacles
+        x: dino.xPos,                 // координата динозавра
+        speed: runner.currentSpeed,   // текущая скорость игры
+        jumping: dino.jumping,        // в прыжке?
+        ducking: dino.ducking,        // присел?
+        dist: runner.distanceRan,     // набранная дистанция
+        passed: (runner.horizon.obstacles || []).filter(o => o.xPos + o.width < dino.xPos).length,  // сколько уже позади
+        obstacles: obstacles          // до двух ближайших препятствий
     };
 }
 """
 
 
-def load_q_table():
-    global q_table
-    if os.path.exists(MODEL_FILE):
-        q_table = np.load(MODEL_FILE, allow_pickle=True).item()
-        print(f"Загружена сохранённая Q-таблица: {len(q_table)} состояний.")
-    else:
-        q_table = {}
-        print("Q-таблица создана с нуля.")
+def read_game(page):
+    """Один вызов JS: получить состояние. При ошибке вернуть статус ERROR."""
+    try:
+        return page.evaluate(STATE_JS)
+    except Exception as error:
+        return {"status": "ERROR", "error": str(error)}
 
 
-def save_q_table():
-    with q_lock:
-        data = dict(q_table)
-    np.save(MODEL_FILE, data)
-    print(f"Q-таблица сохранена в файл {MODEL_FILE} ({len(data)} состояний)")
+def page_visible(page):
+    """Окно не свёрнуто: иначе rAF останавливается и эпизод недействителен."""
+    try:
+        return bool(page.evaluate("() => document.visibilityState === 'visible'"))
+    except Exception:
+        return False
+
+
+# Отключить паузу игры на blur/focus/visibilitychange.
+# Обработчики в игре подписаны через .bind(this), поэтому заменить свойство
+# Runner.instance_.onVisibilityChange после загрузки нельзя - только не дать
+# им подписаться вообще.
+NO_PAUSE_JS = """
+(() => {
+    const add = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function (type, listener, options) {
+        if (type === 'blur' || type === 'focus' || type === 'visibilitychange') return;
+        return add.call(this, type, listener, options);
+    };
+})();
+"""
+
+# Новый забег с нуля: restart() не сработает, пока идёт rAF, поэтому stop().
+# startGame() включает arcade-mode и растягивает контейнер: без него виден
+# только динозавр в полоске шириной 44 px.
+RESTART_JS = """
+() => {
+    const runner = window.Runner && window.Runner.instance_;
+    if (!runner) return false;
+    runner.stop();
+    runner.restart();
+    runner.paused = false;
+    runner.activated = true;        // пропустить вступление
+    runner.playingIntro = false;
+    runner.tRex.playingIntro = false;
+    runner.containerEl.style.width = runner.dimensions.WIDTH + 'px';
+    runner.containerEl.style.height = runner.dimensions.HEIGHT + 'px';
+    const box = document.getElementById('messageBox');
+    if (box) box.style.visibility = 'hidden';  // убрать "Press Space to start"
+    runner.startGame();             // arcade-mode: масштаб и видимая ширина
+    return true;
+}
+"""
+
+
+def obstacle_class(obstacle):
+    """Определить класс препятствия по типу и высоте птицы."""
+    if obstacle["t"] == "PTERODACTYL":
+        y = obstacle["y"]
+        if y <= 60:      # высоко: пролетит над головой
+            return BIRD_HIGH
+        if y <= 92:      # средняя высота: только присед
+            return BIRD_MID
+        return BIRD_LOW  # у земли: только прыжок
+    if obstacle["t"] == "CACTUS_SMALL":
+        return CACTUS_SMALL
+    return CACTUS_LARGE
+
+
+def jump_allowed(raw):
+    """Прыжок только у препятствия, которое действительно перепрыгивается.
+
+    Между кактусами препятствий в зоне прыжка нет - динозавр бежит.
+    Среднюю и высокую птицу прыжком не пройти: там нужен присед или бег.
+    """
+    obstacles = raw.get("obstacles") or []
+    if not obstacles:
+        return False
+    obstacle = obstacles[0]
+    speed = max(float(raw["speed"]), 6.0)
+    dt = (obstacle["x"] - (raw["x"] + DINO_FRONT_OFFSET)) / speed
+    return (
+        JUMP_MIN_FRAMES <= dt <= JUMP_MAX_FRAMES
+        and obstacle_class(obstacle) in JUMPABLE
+    )
+
+
+def encode(raw):
+    """Состояние игры -> вектор из 12 чисел для сети."""
+    obstacles = raw.get("obstacles") or []
+    speed = max(float(raw["speed"]), 6.0)  # защита от деления на ноль
+    cls = NO_OBSTACLE
+    dt = 60.0      # по умолчанию "далеко"
+    width = 0.0    # ширина препятствия в кадрах
+    gap = 60.0     # зазор до второго препятствия в кадрах
+
+    if obstacles:
+        o = obstacles[0]
+        cls = obstacle_class(o)
+        # время до препятствия в кадрах = расстояние / скорость
+        dt = (o["x"] - (raw["x"] + DINO_FRONT_OFFSET)) / speed
+        width = o["w"] / speed
+        if len(obstacles) > 1:
+            # зазор между первым и вторым: нужно, чтобы не приземлиться между ними
+            gap = (obstacles[1]["x"] - (o["x"] + o["w"])) / speed
+
+    vec = np.zeros(N_INPUT, dtype=np.float32)
+    vec[cls] = 1.0                                        # one-hot класса (6 чисел)
+    vec[6] = np.clip(dt, -5.0, 60.0) / 60.0               # dt, нормированный
+    vec[7] = np.clip(width, 0.0, 20.0) / 20.0             # ширина группы
+    vec[8] = raw["speed"] / 13.0                          # скорость
+    vec[9] = np.clip(gap, 0.0, 60.0) / 60.0               # зазор до второго
+    vec[10] = 1.0 if raw["ducking"] else 0.0              # уже присел
+    vec[11] = 1.0 if raw["jumping"] else 0.0              # уже в прыжке
+    return vec
+
+
+class QNet(nn.Module):
+    """Сеть: 12 входов -> 128 -> 128 -> 3 оценки Q(s,a)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(N_INPUT, HIDDEN)   # первый слой
+        self.fc2 = nn.Linear(HIDDEN, HIDDEN)    # второй слой
+        self.fc3 = nn.Linear(HIDDEN, N_ACTIONS) # выход: по числу действий
+
+    def forward(self, x):
+        """Прямой проход: батч состояний -> батч троек Q."""
+        x = F.relu(self.fc1(x))   # нелинейность, иначе слои схлопнутся в один
+        x = F.relu(self.fc2(x))
+        return self.fc3(x)        # без активации: Q может быть любым числом
+
+
+class Agent:
+    """Всё обучение: две сети, оптимизатор, буфер, счётчики."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()              # одна сеть на 4 потока
+        self.online = QNet().to(DEVICE)           # обучаемая сеть
+        self.target = QNet().to(DEVICE)           # замороженная копия для цели
+        self.target.load_state_dict(self.online.state_dict())  # старт одинаковый
+        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=LR)
+        self.buffer = deque(maxlen=BUFFER_SIZE)   # старые переходы вытесняются
+        self.decisions = 0                        # сколько решений принято
+        self.learn_steps = 0                      # сколько шагов обучения
+        self.best_average = 0.0                   # лучшая средняя дистанция за 50
+        self.load()                               # продолжить с файла, если есть
+    def save(self):
+        """Сохранить веса обеих сетей и счётчики."""
+        with self.lock:
+            data = {
+                "online": self.online.state_dict(),
+                "target": self.target.state_dict(),
+                "decisions": self.decisions,
+                "learn_steps": self.learn_steps,
+                "best_average": self.best_average,
+                "metric": METRIC_VERSION,
+            }
+            torch.save(data, self.path)
+        log(f"модель сохранена: {self.path}")
+
+    def save_best(self, average):
+        """Сохранить лучшую модель: худшие веса её не перезаписывают."""
+        with self.lock:
+            self.best_average = average
+            data = {
+                "online": self.online.state_dict(),
+                "target": self.target.state_dict(),
+                "decisions": self.decisions,
+                "learn_steps": self.learn_steps,
+                "best_average": average,
+                "metric": METRIC_VERSION,
+            }
+            torch.save(data, BEST_FILE)
+        log(f"лучшая модель сохранена: средняя {average:.0f}")
+
+    def load(self):
+        """Загрузить модель. Лучшая модель приоритетнее последней."""
+        source = BEST_FILE if BEST_FILE.exists() else self.path
+        if not source.exists():
+            log(f"сеть создана с нуля ({sum(p.numel() for p in self.online.parameters())} параметров)")
+            return
+        try:
+            data = torch.load(source, map_location=DEVICE, weights_only=False)
+            self.online.load_state_dict(data["online"])
+            self.target.load_state_dict(data["target"])
+            # счётчики не откатываем: иначе случайных действий станет больше
+            counters = data
+            if source != self.path and self.path.exists():
+                try:
+                    counters = torch.load(self.path, map_location=DEVICE, weights_only=False)
+                except Exception:
+                    pass
+            self.decisions = max(int(data.get("decisions", 0)), int(counters.get("decisions", 0)))
+            self.learn_steps = max(int(data.get("learn_steps", 0)), int(counters.get("learn_steps", 0)))
+            if data.get("metric") == METRIC_VERSION:
+                self.best_average = float(data.get("best_average", 0.0))
+            else:
+                self.best_average = 0.0   # старый рекорд измерен по другой методике
+                log("старый рекорд средней дистанции сброшен: методика изменилась")
+            log(
+                f"модель загружена ({source.name}): решений {self.decisions}, "
+                f"шагов обучения {self.learn_steps}, лучшая средняя {self.best_average:.0f}"
+            )
+        except Exception as error:
+            log(f"не удалось загрузить модель ({error}), учим с нуля")
+
+    def epsilon(self):
+        """Текущая доля случайных действий: линейно падает по числу решений."""
+        progress = min(1.0, self.decisions / max(1, EPS_DECAY_DECISIONS))
+        return EPS_START + (EPS_END - EPS_START) * progress
+
+    def act(self, vec, epsilon, allow_jump=True):
+        """Выбрать действие: случайное (исследование) или лучшее по сети.
+
+        allow_jump=False маскирует прыжок: без препятствия рядом он не нужен.
+        """
+        with self.lock:
+            self.decisions += 1
+        if random.random() < epsilon:      # исследование
+            if allow_jump:
+                return random.randrange(N_ACTIONS)
+            return random.choice((ACTION_RUN, ACTION_DUCK))
+        with self.lock, torch.no_grad():   # без градиентов: это только выбор
+            q = self.online(torch.from_numpy(vec).unsqueeze(0).to(DEVICE))
+        if not allow_jump:
+            q[0, ACTION_JUMP] = -float("inf")  # запрещённое действие
+        return int(q.argmax(1).item())     # жадное действие
+
+    def push(self, state, action, reward, next_state, done, discount=1.0):
+        """Положить переход в буфер и, если пора, сделать шаг обучения."""
+        with self.lock:
+            self.buffer.append((state, action, reward, next_state, done, discount))
+            ready = len(self.buffer) >= 1000 and self.decisions % TRAIN_EVERY == 0
+        if ready:
+            self.learn()
+
+    def learn(self):
+        """Один шаг градиента по случайному батчу из буфера."""
+        with self.lock:
+            batch = random.sample(self.buffer, BATCH)  # случайность рвёт корреляцию кадров
+
+        states = torch.from_numpy(np.stack([b[0] for b in batch])).to(DEVICE)
+        actions = torch.tensor([b[1] for b in batch], dtype=torch.long, device=DEVICE)
+        rewards = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=DEVICE)
+        next_states = torch.from_numpy(np.stack([b[3] for b in batch])).to(DEVICE)
+        dones = torch.tensor([float(b[4]) for b in batch], dtype=torch.float32, device=DEVICE)
+        discounts = torch.tensor([b[5] for b in batch], dtype=torch.float32, device=DEVICE)
+
+        with self.lock:
+            q_values = self.online(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+            with torch.no_grad():
+                # Double DQN: действие выбирает online, оценивает target
+                next_actions = self.online(next_states).argmax(1, keepdim=True)
+                next_q = self.target(next_states).gather(1, next_actions).squeeze(1)
+                # цель Беллмана; в терминальном состоянии будущего нет
+                target = rewards + (1.0 - dones) * discounts * next_q
+            loss = F.smooth_l1_loss(q_values, target)  # Huber: устойчив к выбросам
+            self.optimizer.zero_grad()                 # обнулить старые градиенты
+            loss.backward()                            # посчитать новые
+            nn.utils.clip_grad_norm_(self.online.parameters(), 10.0)  # ограничить шаг
+            self.optimizer.step()                      # сдвинуть веса
+            self.learn_steps += 1
+            if self.learn_steps % TARGET_SYNC == 0:    # периодически обновить target
+                self.target.load_state_dict(self.online.state_dict())
 
 
 def next_episode():
+    """Выдать номер следующего эпизода или None, если лимит исчерпан."""
     global episodes_started
     with episode_lock:
         if episodes_started >= EPISODES:
@@ -104,200 +435,168 @@ def next_episode():
         return episodes_started
 
 
-def read_game(page):
-    try:
-        return page.evaluate(STATE_JS)
-    except Exception as error:
-        return {"status": "ERROR", "error": str(error)}
-
-
-def obstacle_class(obstacle):
-    if obstacle["t"] == "PTERODACTYL":
-        y = obstacle["y"]
-        if y <= 60:
-            return BIRD_HIGH
-        if y <= 92:
-            return BIRD_MID
-        return BIRD_LOW
-    if obstacle["t"] == "CACTUS_SMALL":
-        return CACTUS_SMALL
-    return CACTUS_LARGE
-
-
-def distance_bucket(dt):
-    if dt <= 4:
-        return 0
-    if dt <= 8:
-        return 1
-    if dt <= 12:
-        return 2
-    if dt <= 17:
-        return 3
-    if dt <= 24:
-        return 4
-    return 5
-
-
-def speed_bucket(speed):
-    if speed < 8.0:
-        return 0
-    if speed < 10.5:
-        return 1
-    return 2
-
-
-def get_state(raw):
-    """Состояние: (класс, dt в кадрах, скорость, второе препятствие, приседает)."""
-    if raw["status"] != "OK":
-        return None, raw["status"]
-
-    speed = max(float(raw["speed"]), 6.0)
-    obstacles = raw["obstacles"]
-    ducking = int(raw["ducking"])
-
-    if not obstacles:
-        return (NO_OBSTACLE, 5, speed_bucket(speed), 0, ducking), "чисто"
-
-    obstacle = obstacles[0]
-    dt = (obstacle["x"] - (raw["x"] + 40)) / speed
-    cls = obstacle_class(obstacle)
-
-    # Второе препятствие близко - нельзя приземляться между ними.
-    second = 0
-    if len(obstacles) > 1:
-        gap = (obstacles[1]["x"] - (obstacle["x"] + obstacle["w"])) / speed
-        if gap <= 25:
-            second = 1
-
-    state = (cls, distance_bucket(dt), speed_bucket(speed), second, ducking)
-    info = f"{CLASS_NAMES[cls]} dt={dt:.1f} speed={raw['speed']:.1f}"
-    return state, info
-
-
-def choose_action(state, epsilon):
-    if random.random() < epsilon:
-        return random.randrange(ACTIONS)
-    with q_lock:
-        values = q_table.setdefault(state, [0.0, 0.0, 0.0])
-        return int(np.argmax(values))
-
-
-def update_q_table(state, action, reward, next_state):
-    with q_lock:
-        values = q_table.setdefault(state, [0.0, 0.0, 0.0])
-        if next_state is None:
-            best_next = 0.0
-        else:
-            best_next = max(q_table.setdefault(next_state, [0.0, 0.0, 0.0]))
-        values[action] += ALPHA * (reward + GAMMA * best_next - values[action])
-
-
 def start_game(page):
-    deadline = time.time() + 10.0
+    """Начать новый забег: дистанция и препятствия сбрасываются."""
+    try:
+        page.evaluate(RESTART_JS)
+    except Exception:
+        pass
+    deadline = time.time() + 5.0
     while time.time() < deadline:
         raw = read_game(page)
         if raw["status"] == "OK":
             return True
+        if raw["status"] == "HIDDEN":
+            return False
         try:
-            page.keyboard.press("Space")
+            page.keyboard.press("Space")  # запасной путь, если restart не сработал
         except Exception:
             pass
-        time.sleep(0.3)
+        time.sleep(0.2)
     return False
 
 
-def epsilon_for(episode):
-    progress = min(1.0, episode / max(1, EPISODES * 0.6))
-    return EPSILON + (EPSILON_MIN - EPSILON) * progress
-
-
-def play_episode(page, episode, epsilon):
+def play_episode(page, agent, episode):
+    """Один эпизод: решения, награды, запись переходов в буфер."""
     if not start_game(page):
-        print(f"окно {episode % WINDOWS}: игра не запустилась")
-        return
+        return None
 
     raw = read_game(page)
-    state, info = get_state(raw)
-    if state is None:
-        return
+    if raw["status"] != "OK":
+        return None
 
-    duck_held = False
-    total_reward = 0
+    vec = encode(raw)                     # текущее состояние
+    passed = int(raw.get("passed", 0))    # сколько препятствий уже позади
+    duck_held = False                     # зажата ли стрелка вниз
+    launch_vec = None                     # состояние, из которого начат прыжок
+    flight_return = 0.0                   # накопленная награда за полёт
+    flight_gamma = 1.0                    # дисконт за время полёта
     started = time.time()
-    step = 0
+    steps = 0
+    total_reward = 0.0
+    end_reason = "OK"
 
     while True:
+        # --- выходы из эпизода ---
         if stop_event.is_set():
+            end_reason = "STOP"
             break
-        if MAX_STEPS and step >= MAX_STEPS:
+        if MAX_STEPS and steps >= MAX_STEPS:
+            end_reason = "LIMIT"
             break
         if MAX_EPISODE_SECONDS and time.time() - started > MAX_EPISODE_SECONDS:
+            end_reason = "TIME"
             break
 
-        action = choose_action(state, epsilon)
+        airborne = bool(raw["jumping"])
+        epsilon = agent.epsilon()
 
-        # Применяем действие
-        try:
-            if action == 1:
-                if duck_held:
-                    page.keyboard.up("ArrowDown")
-                    duck_held = False
-                if not raw["jumping"]:
-                    page.keyboard.press("Space")
-            elif action == 2:
-                if not duck_held:
-                    page.keyboard.down("ArrowDown")
-                    duck_held = True
-            else:
-                if duck_held:
-                    page.keyboard.up("ArrowDown")
-                    duck_held = False
-        except Exception:
-            break
-
-        time.sleep(STEP_DELAY)
-
-        next_raw = read_game(page)
-        next_state, next_info = get_state(next_raw)
-        step += 1
-
-        if next_state is None:
-            reward = -100
-            update_q_table(state, action, reward, None)
-            total_reward += reward
-            print(
-                f"эпизод {episode:4d} | упал на шаге {step:4d} | "
-                f"{info} | награда {total_reward} | eps {epsilon:.2f}"
-            )
+        # --- выбор и применение действия ---
+        if airborne:
+            # в воздухе решение уже принято: только отпускаем присед
             if duck_held:
                 page.keyboard.up("ArrowDown")
-            return
+                duck_held = False
+            action = ACTION_RUN
+            vec = encode(raw)
+        else:
+            # прыжок разрешён только в зоне препятствия, иначе только бег/присед
+            action = agent.act(vec, epsilon, jump_allowed(raw))
+            try:
+                if action == ACTION_JUMP:
+                    if duck_held:                 # из приседа нельзя прыгнуть сразу
+                        page.keyboard.up("ArrowDown")
+                        duck_held = False
+                    if not raw["jumping"]:
+                        page.keyboard.press("Space")   # полный прыжок
+                elif action == ACTION_DUCK:
+                    if not duck_held:
+                        page.keyboard.down("ArrowDown")  # удержание
+                        duck_held = True
+                else:
+                    if duck_held:
+                        page.keyboard.up("ArrowDown")    # встать
+                        duck_held = False
+            except Exception:
+                break
 
-        reward = 1
-        update_q_table(state, action, reward, next_state)
+        time.sleep(STEP_DELAY)          # дать игре прожить шаг
+        next_raw = read_game(page)      # новое состояние
+        steps += 1
+
+        # --- падение ---
+        if next_raw["status"] == "DEAD":
+            end_reason = "DEAD"
+            total_reward += CRASH_REWARD
+            if airborne and launch_vec is not None:
+                # штраф приписываем прыжку, а не состоянию приземления
+                final = flight_return + flight_gamma * CRASH_REWARD
+                agent.push(launch_vec, ACTION_JUMP, final, launch_vec, True)
+            elif not airborne:
+                agent.push(vec, action, CRASH_REWARD, vec, True)
+            if duck_held:
+                page.keyboard.up("ArrowDown")
+            break
+
+        if next_raw["status"] != "OK":   # пауза или ошибка страницы
+            end_reason = next_raw["status"]
+            break
+
+        # --- награда за шаг ---
+        next_vec = encode(next_raw)
+        reward = DIST_REWARD * max(0.0, next_raw["dist"] - raw["dist"])
+
+        next_passed = int(next_raw.get("passed", 0))
+        if next_passed < passed:         # препятствие ушло за экран - счётчик уменьшился
+            passed = next_passed
+        reward += PASS_REWARD * (next_passed - passed)
+        passed = next_passed
+
         total_reward += reward
-        state = next_state
+
+        # --- запись перехода ---
+        if airborne:
+            flight_return += flight_gamma * reward   # копим доход полёта
+            flight_gamma *= GAMMA
+            if not next_raw["jumping"]:              # приземлились
+                if launch_vec is not None:
+                    agent.push(launch_vec, ACTION_JUMP, flight_return, next_vec, False, flight_gamma)
+                launch_vec = None
+        elif action == ACTION_JUMP and next_raw["jumping"]:
+            launch_vec = vec                         # запомнили точку старта
+            flight_return = reward
+            flight_gamma = GAMMA
+        else:
+            agent.push(vec, action, reward, next_vec, False)  # обычный шаг
+
         raw = next_raw
+        vec = next_vec
 
     if duck_held:
         page.keyboard.up("ArrowDown")
-    print(
-        f"эпизод {episode:4d} | шагов {step:4d} | "
-        f"дистанция {int(raw.get('dist', 0))} | награда {total_reward} | eps {epsilon:.2f}"
-    )
+
+    return {
+        "steps": steps,
+        "distance": int(raw.get("dist", 0) or 0),
+        "reward": total_reward,
+        "reason": end_reason,
+        "seconds": time.time() - started,
+    }
 
 
-def window_worker(window_id):
-    print(f"окно {window_id}: запуск Chrome")
+def window_worker(window_id, agent, stats):
+    """Одно окно Chrome: свой браузер, общая сеть и буфер."""
     position = f"--window-position={(window_id % 2) * 720},{(window_id // 2) * 340}"
-    with sync_playwright() as p:
+    log(f"окно {window_id}: запуск Chrome")
+    with sync_playwright() as p:  # у каждого потока свой Playwright
         browser = p.chromium.launch(
-            channel="chrome",
+            channel="chrome",     # системный Chrome, не скачанный Chromium
             headless=HEADLESS,
             args=[
                 "--mute-audio",
                 position,
                 "--window-size=700,320",
+                # не тормозить фоновые окна: иначе игра "замерзает"
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
@@ -305,73 +604,130 @@ def window_worker(window_id):
             ],
         )
         page = browser.new_page(viewport={"width": 700, "height": 260})
+        page.add_init_script(NO_PAUSE_JS)  # до загрузки игры убрать паузу на blur
         page.goto(GAME_URL, wait_until="domcontentloaded")
-        time.sleep(1.5)
-        # Игра встаёт на паузу при потере фокуса - для параллельных окон это смертельно.
-        page.evaluate("() => { Runner.instance_.onVisibilityChange = function () {}; }")
+        time.sleep(1.5)  # дать загрузиться спрайтам
+        # ограничение скорости текущего этапа учебной программы
+        page.evaluate("v => { Runner.config.MAX_SPEED = v; }", current_max_speed())
+
+        deadline = time.time() + TIME_LIMIT_MINUTES * 60 if TIME_LIMIT_MINUTES else None
+        hidden = False
 
         while not stop_event.is_set():
+            if deadline is not None and time.time() > deadline:
+                stop_event.set()
+                break
+            if page.is_closed() or not browser.is_connected():
+                log(f"окно {window_id}: браузер закрыт, поток завершён")
+                break
+            if not page_visible(page):      # свёрнутое окно - не тренируемся
+                if not hidden:
+                    log(f"окно {window_id}: окно скрыто, результаты не пишутся")
+                    hidden = True
+                time.sleep(2.0)
+                continue
+            if hidden:
+                log(f"окно {window_id}: окно снова видно")
+                hidden = False
             episode = next_episode()
             if episode is None:
                 break
-            play_episode(page, episode, epsilon_for(episode))
+
+            result = play_episode(page, agent, episode)
+            if result is None:
+                log(f"окно {window_id}: игра не запустилась")
+                continue
+            if result["reason"] in ("NOT_PLAYING", "HIDDEN", "ERROR"):
+                log(f"окно {window_id}: эпизод {episode} отброшен ({result['reason']})")
+                continue
+
+            improved, average = stats.record(result)
+            if improved:
+                agent.save_best(average)
+            write_result(
+                window_id, episode, result,
+                agent.epsilon(), curriculum_stage + 1, stats.best_average,
+            )
             if episode % SAVE_EVERY == 0:
-                save_q_table()
+                agent.save()
+
+            log(
+                f"окно {window_id} | эпизод {episode:4d} | "
+                f"дистанция {result['distance']:6d} | шагов {result['steps']:5d} | "
+                f"награда {result['reward']:7.1f} | eps {agent.epsilon():.2f} | "
+                f"этап {curriculum_stage + 1} | {result['reason']}"
+            )
+            if episode % 20 == 0:
+                log(stats.summary())
+                if maybe_advance_curriculum(stats.recent_average()):
+                    page.evaluate("v => { Runner.config.MAX_SPEED = v; }", current_max_speed())
 
         browser.close()
-    print(f"окно {window_id}: завершено")
+    log(f"окно {window_id}: завершено")
 
 
-def print_q_table():
-    print("\nИтоговая Q-таблица:")
-    print("Действия: 0=бежать, 1=прыгать, 2=присесть")
-    print("dt: 0-4, 4-8, 8-12, 12-17, 17-24, 24+ кадров")
+class Stats:
+    """Общая статистика по всем окнам."""
 
-    with q_lock:
-        data = dict(q_table)
+    def __init__(self, best_average=0.0):
+        self.lock = threading.Lock()
+        self.episodes = 0
+        self.best = 0
+        self.best_average = best_average   # лучшая средняя за 50, из best_dqn.pt
+        self.recent = deque(maxlen=50)     # последние 50 дистанций
 
-    for cls in (CACTUS_SMALL, CACTUS_LARGE, BIRD_LOW, BIRD_MID, BIRD_HIGH):
-        print(f"\n{CLASS_NAMES[cls]}:")
-        for spb in range(3):
-            actions = []
-            for db in range(6):
-                votes = [0, 0, 0]
-                for second in (0, 1):
-                    for ducking in (0, 1):
-                        values = data.get((cls, db, spb, second, ducking))
-                        if values is not None:
-                            votes[int(np.argmax(values))] += 1
-                actions.append(int(np.argmax(votes)))
-            print(
-                f"  скорость {spb} | действия {actions} | "
-                f"лучшее в корзине dt"
+    def record(self, result):
+        """Учесть эпизод. Вернуть (новый рекорд средней, текущая средняя)."""
+        with self.lock:
+            self.episodes += 1
+            self.recent.append(result["distance"])
+            self.best = max(self.best, result["distance"])
+            average = sum(self.recent) / len(self.recent)
+            improved = len(self.recent) >= 50 and average > self.best_average
+            if improved:
+                self.best_average = average
+        return improved, average
+
+    def recent_average(self):
+        with self.lock:
+            return sum(self.recent) / len(self.recent) if self.recent else 0.0
+
+    def summary(self):
+        with self.lock:
+            average = sum(self.recent) / len(self.recent) if self.recent else 0
+            return (
+                f"ИТОГО: эпизодов {self.episodes}, средняя за 50: {average:.0f}, "
+                f"лучшая {self.best}, лучшая средняя {self.best_average:.0f}"
             )
 
 
 def main():
-    print("Запускаем программу...")
-    load_q_table()
+    """Точка входа: загрузить модель, поднять окна, ждать, сохранить."""
+    log(f"устройство: {DEVICE}")
+    init_results_file()        # results.csv появится сразу
+    agent = Agent(MODEL_FILE)  # сеть + буфер, общие для всех окон
+    stats = Stats(agent.best_average)
 
     threads = []
     for window_id in range(WINDOWS):
-        thread = threading.Thread(target=window_worker, args=(window_id,), daemon=True)
+        thread = threading.Thread(target=window_worker, args=(window_id, agent, stats), daemon=True)
         thread.start()
         threads.append(thread)
-        time.sleep(1.0)
+        time.sleep(1.0)  # не стартовать 4 Chrome одновременно
 
     try:
         while any(thread.is_alive() for thread in threads):
             for thread in threads:
-                thread.join(timeout=0.5)
+                thread.join(timeout=0.5)  # ждём, периодически проверяя флаг остановки
     except KeyboardInterrupt:
-        print("\nОстановка по Ctrl+C...")
+        log("остановка по Ctrl+C")
         stop_event.set()
-        for thread in threads:
-            thread.join(timeout=10)
 
-    save_q_table()
-    print_q_table()
-    print("\nОБУЧЕНИЕ ЗАВЕРШЕНО!")
+    stop_event.set()
+    for thread in threads:
+        thread.join(timeout=10)
+    agent.save()  # финальное сохранение
+    log("обучение завершено")
 
 
 if __name__ == "__main__":
