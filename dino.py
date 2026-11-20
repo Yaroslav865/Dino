@@ -41,7 +41,7 @@ EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройт
 CURRICULUM = [(6.5, 8000), (9.0, 20000), (13.0, None)]
 
 SAVE_EVERY = 20                     # сохранять модель каждые N эпизодов
-METRIC_VERSION = 2                  # версия методики замера дистанции
+METRIC_VERSION = 3                  # версия методики замера дистанции
 MODEL_FILE = Path(__file__).resolve().parent / "dqn.pt"       # последние веса
 BEST_FILE = Path(__file__).resolve().parent / "best_dqn.pt"   # лучшие веса
 RESULTS_FILE = Path(__file__).resolve().parent / "results.csv"  # журнал эпизодов
@@ -83,21 +83,32 @@ def log(message):
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
+RESULTS_HEADER = "time,window,episode,distance,steps,reward,epsilon,stage,reason,best_distance\n"
+
+
 def init_results_file():
-    """Создать results.csv с заголовком, чтобы файл был виден сразу."""
+    """Создать results.csv. Старый формат убрать в results_legacy.csv."""
+    if RESULTS_FILE.exists():
+        try:
+            first_line = RESULTS_FILE.read_text(encoding="utf-8").splitlines()[0]
+        except (OSError, IndexError):
+            first_line = ""
+        if first_line.strip() != RESULTS_HEADER.strip():
+            legacy = RESULTS_FILE.with_name("results_legacy.csv")
+            if legacy.exists():
+                legacy.unlink()
+            RESULTS_FILE.replace(legacy)
+            log(f"старый журнал сохранён как {legacy.name}")
     if not RESULTS_FILE.exists():
-        RESULTS_FILE.write_text(
-            "time,window,episode,distance,steps,reward,epsilon,stage,reason,best_average\n",
-            encoding="utf-8",
-        )
+        RESULTS_FILE.write_text(RESULTS_HEADER, encoding="utf-8")
 
 
-def write_result(window_id, episode, result, epsilon, stage, best_average):
+def write_result(window_id, episode, result, epsilon, stage, best_distance):
     """Дописать строку об эпизоде в results.csv."""
     line = (
         f"{time.strftime('%Y-%m-%d %H:%M:%S')},{window_id},{episode},"
         f"{result['distance']},{result['steps']},{result['reward']:.2f},"
-        f"{epsilon:.3f},{stage},{result['reason']},{best_average:.0f}\n"
+        f"{epsilon:.3f},{stage},{result['reason']},{best_distance}\n"
     )
     with results_lock:
         with RESULTS_FILE.open("a", encoding="utf-8") as file:
@@ -303,7 +314,7 @@ class Agent:
         self.buffer = deque(maxlen=BUFFER_SIZE)   # старые переходы вытесняются
         self.decisions = 0                        # сколько решений принято
         self.learn_steps = 0                      # сколько шагов обучения
-        self.best_average = 0.0                   # лучшая средняя дистанция за 50
+        self.best_distance = 0.0                  # лучшая дистанция за один забег
         self.load()                               # продолжить с файла, если есть
     def save(self):
         """Сохранить веса обеих сетей и счётчики."""
@@ -313,26 +324,26 @@ class Agent:
                 "target": self.target.state_dict(),
                 "decisions": self.decisions,
                 "learn_steps": self.learn_steps,
-                "best_average": self.best_average,
+                "best_distance": self.best_distance,
                 "metric": METRIC_VERSION,
             }
             torch.save(data, self.path)
         log(f"модель сохранена: {self.path}")
 
-    def save_best(self, average):
-        """Сохранить лучшую модель: худшие веса её не перезаписывают."""
+    def save_best(self, distance):
+        """Сохранить лучшую модель по максимальной дистанции."""
         with self.lock:
-            self.best_average = average
+            self.best_distance = distance
             data = {
                 "online": self.online.state_dict(),
                 "target": self.target.state_dict(),
                 "decisions": self.decisions,
                 "learn_steps": self.learn_steps,
-                "best_average": average,
+                "best_distance": distance,
                 "metric": METRIC_VERSION,
             }
             torch.save(data, BEST_FILE)
-        log(f"лучшая модель сохранена: средняя {average:.0f}")
+        log(f"лучшая модель сохранена: дистанция {distance}")
 
     def load(self):
         """Загрузить модель. Лучшая модель приоритетнее последней."""
@@ -354,13 +365,13 @@ class Agent:
             self.decisions = max(int(data.get("decisions", 0)), int(counters.get("decisions", 0)))
             self.learn_steps = max(int(data.get("learn_steps", 0)), int(counters.get("learn_steps", 0)))
             if data.get("metric") == METRIC_VERSION:
-                self.best_average = float(data.get("best_average", 0.0))
+                self.best_distance = float(data.get("best_distance", 0.0))
             else:
-                self.best_average = 0.0   # старый рекорд измерен по другой методике
-                log("старый рекорд средней дистанции сброшен: методика изменилась")
+                self.best_distance = 0.0   # старый рекорд измерен по другой методике
+                log("старый рекорд дистанции сброшен: методика изменилась")
             log(
                 f"модель загружена ({source.name}): решений {self.decisions}, "
-                f"шагов обучения {self.learn_steps}, лучшая средняя {self.best_average:.0f}"
+                f"шагов обучения {self.learn_steps}, лучшая дистанция {self.best_distance:.0f}"
             )
         except Exception as error:
             log(f"не удалось загрузить модель ({error}), учим с нуля")
@@ -641,12 +652,12 @@ def window_worker(window_id, agent, stats):
                 log(f"окно {window_id}: эпизод {episode} отброшен ({result['reason']})")
                 continue
 
-            improved, average = stats.record(result)
+            improved = stats.record(result)
             if improved:
-                agent.save_best(average)
+                agent.save_best(result["distance"])
             write_result(
                 window_id, episode, result,
-                agent.epsilon(), curriculum_stage + 1, stats.best_average,
+                agent.epsilon(), curriculum_stage + 1, stats.best,
             )
             if episode % SAVE_EVERY == 0:
                 agent.save()
@@ -669,24 +680,21 @@ def window_worker(window_id, agent, stats):
 class Stats:
     """Общая статистика по всем окнам."""
 
-    def __init__(self, best_average=0.0):
+    def __init__(self, best_distance=0.0):
         self.lock = threading.Lock()
         self.episodes = 0
-        self.best = 0
-        self.best_average = best_average   # лучшая средняя за 50, из best_dqn.pt
+        self.best = best_distance          # лучшая дистанция, из best_dqn.pt
         self.recent = deque(maxlen=50)     # последние 50 дистанций
 
     def record(self, result):
-        """Учесть эпизод. Вернуть (новый рекорд средней, текущая средняя)."""
+        """Учесть эпизод. Вернуть True, если это новый рекорд дистанции."""
         with self.lock:
             self.episodes += 1
             self.recent.append(result["distance"])
-            self.best = max(self.best, result["distance"])
-            average = sum(self.recent) / len(self.recent)
-            improved = len(self.recent) >= 50 and average > self.best_average
+            improved = result["distance"] > self.best
             if improved:
-                self.best_average = average
-        return improved, average
+                self.best = result["distance"]
+        return improved
 
     def recent_average(self):
         with self.lock:
@@ -697,7 +705,7 @@ class Stats:
             average = sum(self.recent) / len(self.recent) if self.recent else 0
             return (
                 f"ИТОГО: эпизодов {self.episodes}, средняя за 50: {average:.0f}, "
-                f"лучшая {self.best}, лучшая средняя {self.best_average:.0f}"
+                f"лучшая дистанция {self.best}"
             )
 
 
@@ -706,7 +714,7 @@ def main():
     log(f"устройство: {DEVICE}")
     init_results_file()        # results.csv появится сразу
     agent = Agent(MODEL_FILE)  # сеть + буфер, общие для всех окон
-    stats = Stats(agent.best_average)
+    stats = Stats(agent.best_distance)
 
     threads = []
     for window_id in range(WINDOWS):
