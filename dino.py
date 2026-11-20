@@ -13,12 +13,16 @@ from playwright.sync_api import sync_playwright  # управление Chrome
 GAME_URL = "https://wayou.github.io/t-rex-runner/"
 
 # ---------------- параметры ----------------
-WINDOWS = 5     # сколько окон Chrome обучаются одновременно
+# True  - финальный забег: 1 окно, загрузка best_dqn.pt, без обучения и случайности
+# False - обычное обучение
+PLAY_BEST = True
+
+WINDOWS = 1 if PLAY_BEST else 5   # сколько окон Chrome одновременно
 HEADLESS = False          # True - без окон (быстрее, но не видно процесса)
-EPISODES = 3000          # всего эпизодов на все окна
-TIME_LIMIT_MINUTES = 240  # остановка по времени
+EPISODES = 1 if PLAY_BEST else 3000       # всего эпизодов на все окна
+TIME_LIMIT_MINUTES = 0 if PLAY_BEST else 240  # остановка по времени (0 = без лимита)
 MAX_STEPS = 0             # 0 = без лимита шагов, эпизод до падения
-MAX_EPISODE_SECONDS = 300 # страховка от бесконечного эпизода
+MAX_EPISODE_SECONDS = 0 if PLAY_BEST else 300  # 0 = без лимита времени
 STEP_DELAY = 0.02         # пауза между решениями: ~50 решений в секунду
 
 GAMMA = 0.99              # дисконт: насколько важна будущая награда
@@ -33,7 +37,7 @@ DIST_REWARD = 0.01        # награда за единицу пройденн�
 PASS_REWARD = 1.0         # награда за каждое пройденное препятствие
 CRASH_REWARD = -10.0      # штраф за падение
 
-EPS_START = 0.30          # доля случайных действий в начале
+EPS_START = 0.0 if PLAY_BEST else 0.30  # доля случайных действий в начале
 EPS_END = 0.0             # в конце играем строго по сети, без случайности
 EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройти от EPS_START к EPS_END
 
@@ -315,6 +319,7 @@ class Agent:
         self.decisions = 0                        # сколько решений принято
         self.learn_steps = 0                      # сколько шагов обучения
         self.best_distance = 0.0                  # лучшая дистанция за один забег
+        self.learning = not PLAY_BEST             # в финальном режиме не учимся
         self.load()                               # продолжить с файла, если есть
     def save(self):
         """Сохранить веса обеих сетей и счётчики."""
@@ -377,7 +382,9 @@ class Agent:
             log(f"не удалось загрузить модель ({error}), учим с нуля")
 
     def epsilon(self):
-        """Текущая доля случайных действий: линейно падает по числу решений."""
+        """Доля случайных действий. В финальном режиме всегда 0."""
+        if not self.learning:
+            return 0.0
         progress = min(1.0, self.decisions / max(1, EPS_DECAY_DECISIONS))
         return EPS_START + (EPS_END - EPS_START) * progress
 
@@ -400,6 +407,8 @@ class Agent:
 
     def push(self, state, action, reward, next_state, done, discount=1.0):
         """Положить переход в буфер и, если пора, сделать шаг обучения."""
+        if not self.learning:      # финальный забег: только игра
+            return
         with self.lock:
             self.buffer.append((state, action, reward, next_state, done, discount))
             ready = len(self.buffer) >= 1000 and self.decisions % TRAIN_EVERY == 0
@@ -659,7 +668,7 @@ def window_worker(window_id, agent, stats):
                 window_id, episode, result,
                 agent.epsilon(), curriculum_stage + 1, stats.best,
             )
-            if episode % SAVE_EVERY == 0:
+            if episode % SAVE_EVERY == 0 and agent.learning:
                 agent.save()
 
             log(
@@ -712,6 +721,10 @@ class Stats:
 def main():
     """Точка входа: загрузить модель, поднять окна, ждать, сохранить."""
     log(f"устройство: {DEVICE}")
+    if PLAY_BEST:
+        log("режим: финальный забег по best_dqn.pt, без обучения и случайности")
+    else:
+        log("режим: обучение")
     init_results_file()        # results.csv появится сразу
     agent = Agent(MODEL_FILE)  # сеть + буфер, общие для всех окон
     stats = Stats(agent.best_distance)
@@ -734,8 +747,11 @@ def main():
     stop_event.set()
     for thread in threads:
         thread.join(timeout=10)
-    agent.save()  # финальное сохранение
-    log("обучение завершено")
+    if agent.learning:
+        agent.save()  # финальное сохранение
+        log("обучение завершено")
+    else:
+        log("финальный забег завершён")
 
 
 if __name__ == "__main__":

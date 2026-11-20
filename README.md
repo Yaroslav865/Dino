@@ -31,6 +31,20 @@ uv run python dino.py
 uv run playwright install chromium
 ```
 
+## Финальный забег
+
+По умолчанию включён `PLAY_BEST = True`:
+
+- одно окно Chrome (`WINDOWS = 1`);
+- загружается `best_dqn.pt`, случайные действия отключены (`epsilon = 0`);
+- обучение не идёт, буфер не пополняется;
+- нет лимита времени на эпизод (`MAX_EPISODE_SECONDS = 0`), забег идёт
+  до падения или `Ctrl+C`;
+- результат пишется в `results.csv`; если он превысит рекорд,
+  обновится `best_distance` в `best_dqn.pt`.
+
+Чтобы снова обучать, поставьте `PLAY_BEST = False` в начале `dino.py`.
+
 ## Управление и настройки
 
 Все параметры — в начале `dino.py`:
