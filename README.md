@@ -27,9 +27,9 @@ uv run python dino.py
 Режим можно переключать флагом или константой `PLAY_BEST`:
 
 ```powershell
-uv run python dino.py          # финальный забег по best_dqn.pt
-uv run python dino.py --train  # обучение
-uv run python dino.py --play   # принудительно финальный забег
+uv run dino.py          # финальный забег по best_dqn.pt
+uv run dino.py --train  # обучение
+uv run dino.py --play   # принудительно финальный забег
 ```
 
 Если Chrome устанавливать не хочется, можно поставить Chromium для Playwright
