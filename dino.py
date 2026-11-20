@@ -13,6 +13,9 @@ from playwright.sync_api import sync_playwright  # управление Chrome
 
 GAME_URL = "https://wayou.github.io/t-rex-runner/"
 
+# "chrome" - Chrome / Chrome for Testing, None - Chromium из Playwright
+BROWSER_CHANNEL = "chrome"
+
 # ---------------- режим работы ----------------
 # True  - финальный забег: 1 окно, best_dqn.pt, без обучения и случайности
 # False - обучение
@@ -617,7 +620,7 @@ def window_worker(window_id, agent, stats):
     log(f"окно {window_id}: запуск Chrome")
     with sync_playwright() as p:  # у каждого потока свой Playwright
         browser = p.chromium.launch(
-            channel="chrome",     # системный Chrome, не скачанный Chromium
+            channel=BROWSER_CHANNEL,  # "chrome" или None для Chromium
             headless=HEADLESS,
             args=[
                 "--mute-audio",

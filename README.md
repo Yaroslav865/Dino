@@ -8,35 +8,99 @@ Chrome одновременно (число задаётся в `WINDOWS`).
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
-- Google Chrome (код запускает `channel="chrome"`)
+- Chrome или Chromium для Playwright (код запускает `BROWSER_CHANNEL`)
 
 ## Установка на другом устройстве
 
+### 1. uv
+
+Windows:
+
 ```powershell
-# 1. Поставить uv (Windows)
 winget install --id=astral-sh.uv -e
 
-# 2. Поставить Google Chrome, если его нет
-winget install --id=Google.Chrome -e
+# или, если есть Python:
+python -m pip install uv
+```
 
-# 3. В папке проекта
+Linux и macOS:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# macOS с Homebrew:
+brew install uv
+
+# универсальный вариант через pip:
+python3 -m pip install uv
+```
+
+### 2. Зависимости
+
+```bash
 uv sync
-uv run python dino.py
+```
+
+### 3. Браузер — достаточно одного варианта
+
+**Chrome for Testing (одинаково на Windows, Linux и macOS):**
+
+```bash
+uv run playwright install chrome
+
+# Linux: доставить системные библиотеки
+uv run playwright install --with-deps chrome
+```
+
+В `dino.py`:
+
+```python
+BROWSER_CHANNEL = "chrome"
+```
+
+**Chromium:**
+
+```bash
+uv run playwright install chromium
+
+# Linux: доставить системные библиотеки
+uv run playwright install --with-deps chromium
+```
+
+В `dino.py`:
+
+```python
+BROWSER_CHANNEL = None
+```
+
+**Системный Google Chrome** (если он уже стоит):
+
+- Windows: `winget install --id=Google.Chrome -e` или установщик с google.com/chrome;
+- macOS: `brew install --cask google-chrome`;
+- Debian/Ubuntu:
+  ```bash
+  wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+  sudo apt install ./google-chrome-stable_current_amd64.deb
+  ```
+- Fedora:
+  ```bash
+  sudo dnf install https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+  ```
+
+Для системного Chrome оставьте `BROWSER_CHANNEL = "chrome"`.
+
+### 4. Запуск
+
+```bash
+uv run dino.py
 ```
 
 Режим можно переключать флагом или константой `PLAY_BEST`:
 
-```powershell
+```bash
 uv run dino.py          # финальный забег по best_dqn.pt
 uv run dino.py --train  # обучение
 uv run dino.py --play   # принудительно финальный забег
-```
-
-Если Chrome устанавливать не хочется, можно поставить Chromium для Playwright
-и заменить в `dino.py` `channel="chrome"` на `channel=None`:
-
-```powershell
-uv run playwright install chromium
 ```
 
 ## Финальный забег
