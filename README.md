@@ -24,6 +24,14 @@ uv sync
 uv run python dino.py
 ```
 
+Режим можно переключать флагом или константой `PLAY_BEST`:
+
+```powershell
+uv run python dino.py          # финальный забег по best_dqn.pt
+uv run python dino.py --train  # обучение
+uv run python dino.py --play   # принудительно финальный забег
+```
+
 Если Chrome устанавливать не хочется, можно поставить Chromium для Playwright
 и заменить в `dino.py` `channel="chrome"` на `channel=None`:
 
@@ -43,7 +51,8 @@ uv run playwright install chromium
 - результат пишется в `results.csv`; если он превысит рекорд,
   обновится `best_distance` в `best_dqn.pt`.
 
-Чтобы снова обучать, поставьте `PLAY_BEST = False` в начале `dino.py`.
+Чтобы снова обучать, поставьте `PLAY_BEST = False` в начале `dino.py`
+или запустите с флагом `--train`.
 
 ## Управление и настройки
 

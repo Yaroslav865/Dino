@@ -1,4 +1,5 @@
 import random                 # случайные действия (исследование) и выборка из буфера
+import sys                    # флаги --play / --train
 import threading              # 4 окна = 4 потока + общий доступ к сети и буферу
 import time                   # паузы между решениями и таймауты
 from collections import deque # буфер воспроизведения фиксированной длины
@@ -12,11 +13,17 @@ from playwright.sync_api import sync_playwright  # управление Chrome
 
 GAME_URL = "https://wayou.github.io/t-rex-runner/"
 
-# ---------------- параметры ----------------
-# True  - финальный забег: 1 окно, загрузка best_dqn.pt, без обучения и случайности
-# False - обычное обучение
+# ---------------- режим работы ----------------
+# True  - финальный забег: 1 окно, best_dqn.pt, без обучения и случайности
+# False - обучение
+# Переключать здесь или флагами: --play / --train
 PLAY_BEST = True
+if "--train" in sys.argv:
+    PLAY_BEST = False
+elif "--play" in sys.argv:
+    PLAY_BEST = True
 
+# ---------------- параметры ----------------
 WINDOWS = 1 if PLAY_BEST else 5   # сколько окон Chrome одновременно
 HEADLESS = False          # True - без окон (быстрее, но не видно процесса)
 EPISODES = 1 if PLAY_BEST else 3000       # всего эпизодов на все окна
