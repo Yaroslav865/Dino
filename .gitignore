@@ -11,3 +11,8 @@ wheels/
 
 # Старый файл табличного агента, в коде не используется
 q_table.npy
+
+# Создаются при запуске; best_dqn.pt остаётся в репозитории
+dqn.pt
+results.csv
+results_legacy.csv
