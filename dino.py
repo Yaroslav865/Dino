@@ -28,7 +28,7 @@ elif "--play" in sys.argv:
 
 # ---------------- параметры ----------------
 WINDOWS = 1 if PLAY_BEST else 5   # сколько окон Chrome одновременно
-HEADLESS = False          # True - без окон (быстрее, но не видно процесса)
+HEADLESS = True          # True - без окон (быстрее, но не видно процесса)
 EPISODES = 1 if PLAY_BEST else 3000       # всего эпизодов на все окна
 TIME_LIMIT_MINUTES = 0 if PLAY_BEST else 240  # остановка по времени (0 = без лимита)
 MAX_STEPS = 0             # 0 = без лимита шагов, эпизод до падения
