@@ -48,6 +48,7 @@ PASS_REWARD = 1.0         # награда за каждое пройденно�
 CRASH_REWARD = -10.0      # штраф за падение
 
 EPS_START = 0.0 if PLAY_BEST else 0.30  # доля случайных действий в начале
+RESUME_EPS_START = 0.05   # старт исследования при продолжении с best_dqn.pt
 EPS_END = 0.0             # в конце играем строго по сети, без случайности
 EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройти от EPS_START к EPS_END
 
@@ -332,6 +333,7 @@ class Agent:
         self.learn_steps = 0                      # сколько шагов обучения
         self.best_distance = 0.0                  # лучшая дистанция за один забег
         self.learning = not PLAY_BEST             # в финальном режиме не учимся
+        self.eps_start = EPS_START                # при загрузке best станет меньше
         self.load()                               # продолжить с файла, если есть
     def save(self):
         """Сохранить веса обеих сетей и счётчики."""
@@ -346,21 +348,6 @@ class Agent:
             }
             torch.save(data, self.path)
         log(f"модель сохранена: {self.path}")
-
-    def save_best(self, distance):
-        """Сохранить лучшую модель по максимальной дистанции."""
-        with self.lock:
-            self.best_distance = distance
-            data = {
-                "online": self.online.state_dict(),
-                "target": self.target.state_dict(),
-                "decisions": self.decisions,
-                "learn_steps": self.learn_steps,
-                "best_distance": distance,
-                "metric": METRIC_VERSION,
-            }
-            torch.save(data, BEST_FILE)
-        log(f"лучшая модель сохранена: дистанция {distance}")
 
     def save_best_from(self, other, distance):
         """Сохранить лучшую модель из проверочной копии, не трогая online."""
@@ -418,9 +405,12 @@ class Agent:
             else:
                 self.best_distance = 0.0   # старый рекорд измерен по другой методике
                 log("старый рекорд дистанции сброшен: методика изменилась")
+            # после лучшей модели начинаем с малого исследования
+            self.eps_start = RESUME_EPS_START if source == BEST_FILE else EPS_START
             log(
                 f"модель загружена ({source.name}): решений {self.decisions}, "
-                f"шагов обучения {self.learn_steps}, лучшая дистанция {self.best_distance:.0f}"
+                f"шагов обучения {self.learn_steps}, лучшая дистанция {self.best_distance:.0f}, "
+                f"epsilon_start {self.eps_start:.2f}"
             )
         except Exception as error:
             log(f"не удалось загрузить модель ({error}), учим с нуля")
@@ -430,7 +420,7 @@ class Agent:
         if not self.learning:
             return 0.0
         progress = min(1.0, self.decisions / max(1, EPS_DECAY_DECISIONS))
-        return EPS_START + (EPS_END - EPS_START) * progress
+        return self.eps_start + (EPS_END - self.eps_start) * progress
 
     def act(self, vec, epsilon, allow_jump=True):
         """Выбрать действие: случайное (исследование) или лучшее по сети.
@@ -731,9 +721,7 @@ def window_worker(window_id, agent, stats):
                 log(f"окно {window_id}: эпизод {episode} отброшен ({result['reason']})")
                 continue
 
-            improved = stats.record(result)
-            if improved:
-                agent.save_best(result["distance"])
+            stats.record(result)
             write_result(
                 window_id, episode, result,
                 agent.epsilon(), curriculum_stage + 1, stats.best,
@@ -769,14 +757,10 @@ class Stats:
         self.recent = deque(maxlen=50)     # последние 50 дистанций
 
     def record(self, result):
-        """Учесть эпизод. Вернуть True, если это новый рекорд дистанции."""
+        """Учесть обучающий эпизод. Рекорд обновляет только проверка."""
         with self.lock:
             self.episodes += 1
             self.recent.append(result["distance"])
-            improved = result["distance"] > self.best
-            if improved:
-                self.best = result["distance"]
-        return improved
 
     def record_eval(self, distance):
         """Учесть проверочный забег: только рекорд, без средней за 50."""
