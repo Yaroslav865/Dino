@@ -26,13 +26,17 @@ if "--train" in sys.argv:
 elif "--play" in sys.argv:
     PLAY_BEST = True
 
+# True - обучение без случайных действий, как финальный забег
+# False - обучение с исследованием (epsilon) и проверками рекорда
+TRAIN_GREEDY = True
+
 # ---------------- параметры ----------------
 WINDOWS = 1 if PLAY_BEST else 5   # сколько окон Chrome одновременно
 HEADLESS = True          # True - без окон (быстрее, но не видно процесса)
 EPISODES = 1 if PLAY_BEST else 3000       # всего эпизодов на все окна
 TIME_LIMIT_MINUTES = 0 if PLAY_BEST else 240  # остановка по времени (0 = без лимита)
 MAX_STEPS = 0             # 0 = без лимита шагов, эпизод до падения
-MAX_EPISODE_SECONDS = 0 if PLAY_BEST else 300  # 0 = без лимита времени
+MAX_EPISODE_SECONDS = 0 if (PLAY_BEST or TRAIN_GREEDY) else 300  # 0 = без лимита времени
 STEP_DELAY = 0.02         # пауза между решениями: ~50 решений в секунду
 
 GAMMA = 0.99              # дисконт: насколько важна будущая награда
@@ -47,8 +51,8 @@ DIST_REWARD = 0.01        # награда за единицу пройденн�
 PASS_REWARD = 1.0         # награда за каждое пройденное препятствие
 CRASH_REWARD = -10.0      # штраф за падение
 
-EPS_START = 0.0 if PLAY_BEST else 0.30  # доля случайных действий в начале
-RESUME_EPS_START = 0.05   # старт исследования при продолжении с best_dqn.pt
+EPS_START = 0.0 if (PLAY_BEST or TRAIN_GREEDY) else 0.30  # доля случайных действий в начале
+RESUME_EPS_START = 0.0 if TRAIN_GREEDY else 0.05  # старт исследования с best_dqn.pt
 EPS_END = 0.0             # в конце играем строго по сети, без случайности
 EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройти от EPS_START к EPS_END
 
@@ -363,6 +367,10 @@ class Agent:
             }
             torch.save(data, BEST_FILE)
         log(f"лучшая модель сохранена: дистанция {distance}")
+
+    def save_best(self, distance):
+        """Сохранить текущие веса online/target как лучшие."""
+        self.save_best_from(self, distance)
 
     def clone_for_eval(self):
         """Копия текущих весов: проверочный забег без обучения и случайности."""
@@ -721,7 +729,9 @@ def window_worker(window_id, agent, stats):
                 log(f"окно {window_id}: эпизод {episode} отброшен ({result['reason']})")
                 continue
 
-            stats.record(result)
+            improved = stats.record(result, update_best=TRAIN_GREEDY)
+            if improved:
+                agent.save_best(result["distance"])
             write_result(
                 window_id, episode, result,
                 agent.epsilon(), curriculum_stage + 1, stats.best,
@@ -740,7 +750,7 @@ def window_worker(window_id, agent, stats):
                 if maybe_advance_curriculum(stats.recent_average()):
                     page.evaluate("v => { Runner.config.MAX_SPEED = v; }", current_max_speed())
 
-            if agent.learning and episode % RECORD_EVERY == 0:
+            if agent.learning and not TRAIN_GREEDY and episode % RECORD_EVERY == 0:
                 run_record_attempt(page, agent, stats, window_id, episode)
 
         browser.close()
@@ -756,11 +766,15 @@ class Stats:
         self.best = best_distance          # лучшая дистанция, из best_dqn.pt
         self.recent = deque(maxlen=50)     # последние 50 дистанций
 
-    def record(self, result):
-        """Учесть обучающий эпизод. Рекорд обновляет только проверка."""
+    def record(self, result, update_best=False):
+        """Учесть эпизод. При update_best обновить рекорд и вернуть True."""
         with self.lock:
             self.episodes += 1
             self.recent.append(result["distance"])
+            if update_best and result["distance"] > self.best:
+                self.best = result["distance"]
+                return True
+        return False
 
     def record_eval(self, distance):
         """Учесть проверочный забег: только рекорд, без средней за 50."""
