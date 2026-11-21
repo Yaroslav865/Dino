@@ -55,6 +55,8 @@ EPS_DECAY_DECISIONS = 1_000_000  # за сколько решений пройт
 CURRICULUM = [(6.5, 8000), (9.0, 20000), (13.0, None)]
 
 SAVE_EVERY = 20                     # сохранять модель каждые N эпизодов
+RECORD_EVERY = 100                  # раз в N эпизодов проверять рекорд без исследования
+RECORD_ATTEMPT_SECONDS = 600        # лимит проверочного забега (10 минут)
 METRIC_VERSION = 3                  # версия методики замера дистанции
 MODEL_FILE = Path(__file__).resolve().parent / "dqn.pt"       # последние веса
 BEST_FILE = Path(__file__).resolve().parent / "best_dqn.pt"   # лучшие веса
@@ -360,6 +362,38 @@ class Agent:
             torch.save(data, BEST_FILE)
         log(f"лучшая модель сохранена: дистанция {distance}")
 
+    def save_best_from(self, other, distance):
+        """Сохранить лучшую модель из проверочной копии, не трогая online."""
+        with self.lock:
+            self.best_distance = distance
+            data = {
+                "online": other.online.state_dict(),
+                "target": other.target.state_dict(),
+                "decisions": self.decisions,
+                "learn_steps": self.learn_steps,
+                "best_distance": distance,
+                "metric": METRIC_VERSION,
+            }
+            torch.save(data, BEST_FILE)
+        log(f"лучшая модель сохранена: дистанция {distance}")
+
+    def clone_for_eval(self):
+        """Копия текущих весов: проверочный забег без обучения и случайности."""
+        clone = Agent.__new__(Agent)      # не вызываем __init__/load
+        clone.path = self.path
+        clone.lock = threading.Lock()
+        clone.online = QNet().to(DEVICE)
+        clone.target = QNet().to(DEVICE)
+        with self.lock:
+            clone.online.load_state_dict(self.online.state_dict())
+            clone.target.load_state_dict(self.target.state_dict())
+        clone.buffer = deque(maxlen=1)
+        clone.decisions = self.decisions
+        clone.learn_steps = self.learn_steps
+        clone.best_distance = self.best_distance
+        clone.learning = False            # push() ничего не делает, epsilon() = 0
+        return clone
+
     def load(self):
         """Загрузить модель. Лучшая модель приоритетнее последней."""
         source = BEST_FILE if BEST_FILE.exists() else self.path
@@ -486,14 +520,19 @@ def start_game(page):
     return False
 
 
-def play_episode(page, agent, episode):
-    """Один эпизод: решения, награды, запись переходов в буфер."""
+def play_episode(page, agent, episode, max_seconds=None):
+    """Один эпизод: решения, награды, запись переходов в буфер.
+
+    max_seconds переопределяет MAX_EPISODE_SECONDS (для проверки рекорда).
+    """
     if not start_game(page):
         return None
 
     raw = read_game(page)
     if raw["status"] != "OK":
         return None
+
+    limit = MAX_EPISODE_SECONDS if max_seconds is None else max_seconds
 
     vec = encode(raw)                     # текущее состояние
     passed = int(raw.get("passed", 0))    # сколько препятствий уже позади
@@ -514,7 +553,7 @@ def play_episode(page, agent, episode):
         if MAX_STEPS and steps >= MAX_STEPS:
             end_reason = "LIMIT"
             break
-        if MAX_EPISODE_SECONDS and time.time() - started > MAX_EPISODE_SECONDS:
+        if limit and time.time() - started > limit:
             end_reason = "TIME"
             break
 
@@ -614,6 +653,27 @@ def play_episode(page, agent, episode):
     }
 
 
+def run_record_attempt(page, agent, stats, window_id, episode):
+    """Проверка текущих весов без исследования: может побить рекорд и обновить best."""
+    log(f"окно {window_id}: проверка рекорда, эпизод {episode}")
+    clone = agent.clone_for_eval()
+    result = play_episode(page, clone, episode, max_seconds=RECORD_ATTEMPT_SECONDS)
+    if result is None:
+        log(f"окно {window_id}: проверка не запустилась")
+        return
+    if result["reason"] not in ("DEAD", "TIME"):
+        log(f"окно {window_id}: проверка отброшена ({result['reason']})")
+        return
+    if stats.record_eval(result["distance"]):
+        agent.save_best_from(clone, result["distance"])
+    result["reason"] = "EVAL_" + result["reason"]
+    write_result(window_id, episode, result, 0.0, curriculum_stage + 1, stats.best)
+    log(
+        f"окно {window_id} | проверка {episode:4d} | "
+        f"дистанция {result['distance']:6d} | рекорд {stats.best} | {result['reason']}"
+    )
+
+
 def window_worker(window_id, agent, stats):
     """Одно окно Chrome: свой браузер, общая сеть и буфер."""
     position = f"--window-position={(window_id % 2) * 720},{(window_id // 2) * 340}"
@@ -692,6 +752,9 @@ def window_worker(window_id, agent, stats):
                 if maybe_advance_curriculum(stats.recent_average()):
                     page.evaluate("v => { Runner.config.MAX_SPEED = v; }", current_max_speed())
 
+            if agent.learning and episode % RECORD_EVERY == 0:
+                run_record_attempt(page, agent, stats, window_id, episode)
+
         browser.close()
     log(f"окно {window_id}: завершено")
 
@@ -714,6 +777,14 @@ class Stats:
             if improved:
                 self.best = result["distance"]
         return improved
+
+    def record_eval(self, distance):
+        """Учесть проверочный забег: только рекорд, без средней за 50."""
+        with self.lock:
+            if distance > self.best:
+                self.best = distance
+                return True
+        return False
 
     def recent_average(self):
         with self.lock:
