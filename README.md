@@ -151,7 +151,7 @@ uv run dino.py --train
 - `RECORD_EVERY` — проверка рекорда каждые N эпизодов (при `TRAIN_GREEDY = False`);
 - `RECORD_ATTEMPT_SECONDS` — лимит проверочного забега (при `TRAIN_GREEDY = False`);
 - `RESUME_EPS_START` — старт исследования при загрузке `best_dqn.pt` (0 при `TRAIN_GREEDY = True`, иначе 0.05);
-- `HEADLESS = True` — без видимых окон (быстрее, но не видно процесса);
+- `HEADLESS` — в финальном забеге `False` (окно видно), в обучении `True` (без окон);
 - `EPS_END` / `EPS_DECAY_DECISIONS` — исследование (только при `TRAIN_GREEDY = False`).
 
 Остановка — `Ctrl+C`; в режиме обучения модель сохраняется.
