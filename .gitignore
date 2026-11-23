@@ -1,18 +1,16 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
+*.py[cod]
 build/
 dist/
-wheels/
-*.egg-info
+*.egg-info/
+.pytest_cache/
 
 # Virtual environments
-.venv
+.venv/
 
-# Старый файл табличного агента, в коде не используется
-q_table.npy
-
-# Создаются при запуске; best_dqn.pt остаётся в репозитории
+# Training artifacts
 dqn.pt
 results.csv
-results_legacy.csv
+results_*.csv
+*.log
